@@ -1,1 +1,618 @@
+# Deploy operators registry for ocp with specific versions
 
+**Create the registry**
+
+- Create directories for the registry data and certs:
+
+```
+$ sudo mkdir -p /opt/registry/{certs,data}
+$ sudo chown -R $USER /opt/registry
+```
+
+- Place your trusted certificate and key in /opt/registry as domain.crt and domain.key and run the registry:
+
+```
+$ podman run -d --name mirror-registry \
+    -p 5000:5000 --restart=always \
+    -v /opt/registry/data:/var/lib/registry:z \
+    -v /opt/registry/certs:/certs:z \
+    -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/domain.crt \
+    -e REGISTRY_HTTP_TLS_KEY=/certs/domain.key \
+    docker.io/library/registry:2
+```
+
+**Search for the operators we are interested in**
+
+- Disable the default OperatorSources of Openshift: 
+
+```
+$ oc patch OperatorHub cluster --type json \
+    -p '[{"op": "add", "path": "/spec/disableAllDefaultSources", "value": true}]'
+```
+
+- To get the list of packages that are available for the default OperatorSources, run the following curl commands from your workstation without network restrictions, this case we will do it for redhat-operators
+
+```
+$ curl https://quay.io/cnr/api/v1/packages?namespace=redhat-operators > packages.txt
+```
+
+- Once we have our packages.txt we will be able to see the list of operators from that sources and the historical releases of that operator; in this case we want to install this operators with the following versions: 
+
+```
+Elasticsearch: 4.5.0-202011070318.p0
+Jaeger: 1.17.7
+Kiali: 1.24.2
+OSSM: 2.0.0.2
+```
+
+- They all come fro redhat-operators source, so what we will do is look at there name in packages.txt and search for the release we want.
+
+**Kiali Operator**
+
+- For each operator we can make a curl in which we will be able to see the historic for every release the operator has with there related versions:
+
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/kiali-ossm | jq .
+```
+
+- This is a example of what we will get:
+```
+  {
+    "content": {
+      "digest": "88a756975445a18d37f50a9aefc1676f6015c92abb6db23c29ba33e5e28093e3",
+      "mediaType": "application/vnd.cnr.package.helm.v0.tar+gzip",
+      "size": 16622,
+      "urls": []
+    },
+    "created_at": "2020-11-16T22:51:32",
+    "digest": "sha256:6f0f37f81fe7d64baa3fdc127c6a58e26f8b635f21e199b403f4deb8f857d173",
+    "mediaType": "application/vnd.cnr.package-manifest.helm.v0.json",
+    "metadata": null,
+    "package": "redhat-operators/kiali-ossm",
+    "release": "20.0.0"
+  },
+  {
+    "content": {
+      "digest": "16761a96df30f5b1cb8a0a96cb00d69610fac124aefeccddfc73f87e149567b5",
+      "mediaType": "application/vnd.cnr.package.helm.v0.tar+gzip",
+      "size": 18080,
+      "urls": []
+    },
+    "created_at": "2020-11-16T23:26:01",
+    "digest": "sha256:6af142b2d04a96f9e7564910a8146f0f57d830006184c20f56fba6bf0aacf0c8",
+    "mediaType": "application/vnd.cnr.package-manifest.helm.v0.json",
+    "metadata": null,
+    "package": "redhat-operators/kiali-ossm",
+    "release": "21.0.0"
+  },
+```
+- We will get a list of releases and we will have to look at the date in which that release where launched if we want to have to exact version of that release. 
+In this case we want the operator from november 2020 -> 2020-11-*, so the information we will take from here to download our operator image will be the digest related with content:
+```
+"content": {
+      "digest": "16761a96df30f5b1cb8a0a96cb00d69610fac124aefeccddfc73f87e149567b5",
+```
+
+- Be careful because there are two digests here, but the one we are interested in is the one which appears in content.
+
+- Once we have our digest, we will make a curl for downloading the manifests of that specific release of our operator:
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/kiali-ossm/blobs/sha256/16761a96df30f5b1cb8a0a96cb00d69610fac124aefeccddfc73f87e149567b5 -o kiali-ossm.tar.gz
+$ tar xvf kiali-ossm.tar.gz
+$ ls kiali-ossm-n1or_5yc/
+1.0.10/  1.0.12/  1.0.6/  1.0.8/  1.12.11/  1.12.13/  1.12.15/	1.12.7/  package.yaml
+1.0.11/  1.0.5/   1.0.7/  1.0.9/  1.12.12/  1.12.14/  1.12.16/	1.24.2/
+```
+
+- If we decompress the tar file generated, we will be able to see a list of all the versions of the operator that this release has; if we take a look of the package.yaml file, we will see its associated channels, in this case we only have the stable one:
+```
+$ cat package.yaml
+packageName: kiali-ossm
+channels:
+- name: stable
+  currentCSV: kiali-operator.v1.24.2
+defaultChannel: stable
+```
+- With this file we will specify the version and the channel we want; Also lets take a look the one of the directories to check its content:
+```
+$ ls 1.24.2/
+kiali.clusterserviceversion.yaml  kiali.crd.yaml  kiali.monitoringdashboards.crd.yaml
+```
+- In each directory we have the necesary components for the operator to work, in this case we have the CSV and CRDs for kiali.
+
+- Once we have the package.yaml file with the version we want and the specific directory for that version, with create a tree with the following structure:
+```
+$ tree manifests
+manifests/
+└── etcd
+    ├── 1.24.2
+    │   ├── kiali.clusterserviceversion.yaml
+    │   ├── kiali.crd.yaml
+    │   └── kiali.monitoringdashboards.crd.yaml
+    └── package.yaml
+
+2 directories, 4 files
+```
+- Once we have this tree structure we will create a Dockerfile named "custom-registry.Dockerfile" with the following content:
+```
+FROM registry.redhat.io/openshift4/ose-operator-registry:v4.2.24 AS builder
+
+COPY manifests manifests
+
+RUN /bin/initializer -o ./bundles.db
+
+FROM registry.access.redhat.com/ubi7/ubi
+
+COPY --from=builder /registry/bundles.db /bundles.db
+COPY --from=builder /usr/bin/registry-server /registry-server
+COPY --from=builder /bin/grpc_health_probe /bin/grpc_health_probe
+
+EXPOSE 50051
+
+ENTRYPOINT ["/registry-server"]
+
+CMD ["--database", "bundles.db"]
+```
+- This Dockerfile we take as base image "registry.redhat.io/openshift4/ose-operator-registry:v4.2.24" which is a registry image for operators, and will create an image of this specific operator with the specific version:
+```
+$ podman build -f custom-registry.Dockerfile \
+    -t <local_registry_host_name>:<local_registry_host_port>/<namespace>/custom-registry
+```
+In my case:
+```
+podman build -f custom-registry.Dockerfile \
+    -t regisrty.lab:5000/olm/kiali:v1.24.2
+```
+
+- What happens in this case is that we get the following error, this depends on the operator:
+```
+$ podman build -f custom-registry.Dockerfile     -t regisrty.lab:5000/olm/kiali:v1.24.2
+STEP 1: FROM registry.redhat.io/openshift4/ose-operator-registry:v4.2.24 AS builder
+STEP 2: COPY manifests manifests
+1776fb2dd40a14aa01f14fe1d6aab3f72c8e012ed700430daae8d042f8ea7ac4
+STEP 3: RUN /bin/initializer -o ./bundles.db
+INFO[0000] loading Bundles                               dir=manifests
+INFO[0000] directory                                     dir=manifests file=manifests load=bundles
+INFO[0000] directory                                     dir=manifests file=etcd load=bundles
+INFO[0000] directory                                     dir=manifests file=1.24.2 load=bundles
+INFO[0000] found csv, loading bundle                     dir=manifests file=kiali.clusterserviceversion.yaml load=bundles
+INFO[0000] loading bundle file                           dir=manifests file=kiali.clusterserviceversion.yaml load=bundle
+INFO[0000] loading bundle file                           dir=manifests file=kiali.crd.yaml load=bundle
+INFO[0000] loading bundle file                           dir=manifests file=kiali.monitoringdashboards.crd.yaml load=bundle
+INFO[0000] loading Packages and Entries                  dir=manifests
+INFO[0000] directory                                     dir=manifests file=manifests load=package
+INFO[0000] directory                                     dir=manifests file=etcd load=package
+INFO[0000] directory                                     dir=manifests file=1.24.2 load=package
+FATA[0000] permissive mode disabled                      error="error loading manifests from directory: error loading package into db: kiali-operator.v1.24.2 specifies replacement that couldn't be found"
+Error: error building at STEP "RUN /bin/initializer -o ./bundles.db": error while running runtime: exit status 1
+```
+
+- What happens here is that there is a field called "replaces" in the ".spec.replaces" field in the CSV of the operator; let's take a look to it:
+```
+$ cat kiali.clusterserviceversion.yaml
+...
+spec:
+  version: 1.24.2
+  maturity: stable
+  replaces: kiali-operator.v1.12.16
+...
+```
+This means that this CSV needs the kiali-operator.v1.12.16 also to be present in the image for the build to work; the thing is that if we take a look at the CSV of kiali-operator.v1.12.16 it will also replace an older kiali version, so we will have to be taking one by one; for avoiding this, we can include all the directories and put all them into our "manifests/etcd" directory:
+```
+$ cp -r 1.*/ manifests/etcd/
+$ tree manifests/etcd/
+manifests/etcd/
+├── 1.0.10
+│   ├── kiali.crd.yaml
+│   ├── kiali.monitoringdashboards.crd.yaml
+│   └── kiali.v1.0.10.clusterserviceversion.yaml
+├── 1.0.11
+│   ├── kiali.crd.yaml
+│   ├── kiali.monitoringdashboards.crd.yaml
+│   └── kiali.v1.0.11.clusterserviceversion.yaml
+.
+.
+.
+├── 1.12.7
+│   ├── kiali.crd.yaml
+│   ├── kiali.monitoringdashboards.crd.yaml
+│   └── kiali.v1.12.7.clusterserviceversion.yaml
+├── 1.24.2
+│   ├── kiali.clusterserviceversion.yaml
+│   ├── kiali.crd.yaml
+│   └── kiali.monitoringdashboards.crd.yaml
+└── package.yaml
+
+16 directories, 49 files
+```
+- Now we will try to build the image again:
+```
+$ podman build -f custom-registry.Dockerfile     -t regisrty.lab:5000/olm/kiali:v1.24.2
+STEP 1: FROM registry.redhat.io/openshift4/ose-operator-registry:v4.2.24 AS builder
+.
+.
+.
+STEP 11: COMMIT regisrty.lab:5000/olm/kiali:v1.24.2
+20d83ffc86cad9318f396ad3d2c7a2c514dea01daabeeabe405b9e59870e89ab
+```
+- This time the build completes and we have our image, so we will push the image to our registry:
+```
+$ podman push registry:5000/olm/kiali:v1.24.2
+Getting image source signatures
+Copying blob d3e47b9840ac skipped: already exists
+Copying blob 0fb48767aa19 skipped: already exists
+Copying blob 0a09f3e3b50c skipped: already exists
+Copying blob 82480151b3e2 skipped: already exists
+Copying blob f4ccdae92040 skipped: already exists
+Copying config af33e72854 done
+Writing manifest to image destination
+Storing signatures
+```
+- With this we have our kiali-ossm:v1.24.2 operator in our registry
+
+**ElasticSearch Operator**
+
+- This time we will follow the same procedure but for the elasticseacrh operator with version: "elasticsearch: 4.5.0-202011070318.p0"; So first we will get the list of releases:
+
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/elasticsearch-operator | jq .
+  {
+    "content": {
+      "digest": "d9bf3b92a95b4b4d99e3f1cd805a2256c44634b9f71e8e6d5f41cf3751d55ac3",
+      "mediaType": "application/vnd.cnr.package.helm.v0.tar+gzip",
+      "size": 7788,
+      "urls": []
+    },
+    "created_at": "2020-11-17T16:47:21",
+    "digest": "sha256:26fe8f578247f4dab6193fc2fe495f443baa05858db62d26d59cf1d659821128",
+    "mediaType": "application/vnd.cnr.package-manifest.helm.v0.json",
+    "metadata": null,
+    "package": "redhat-operators/elasticsearch-operator",
+    "release": "104.0.0"
+  },
+
+```
+- So once we have our release, in our case the one above, we take the digest from content and work with it:
+```
+"content": {
+      "digest": "d9bf3b92a95b4b4d99e3f1cd805a2256c44634b9f71e8e6d5f41cf3751d55ac3",
+```
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/elasticsearch-operator/blobs/sha256/d9bf3b92a95b4b4d99e3f1cd805a2256c44634b9f71e8e6d5f41cf3751d55ac3 -o elasticsearch-operator.tar.gz
+$ tar xvf elasticsearch-operator.tar.gz
+$ ls elasticsearch-operator-mkzc7kv7/
+4.1/  4.2/  4.2-s390x/	4.3/  4.4/  4.5/  elasticsearch-operator.package.yaml
+```
+- So once we decompress it, we will take a look at its channels and make sure the corresponding channel is pointing to our desired version:
+```
+$ cat elasticsearch-operator.package.yaml 
+channels:
+- currentCSV: elasticsearch-operator.4.1.41-202004130646
+  name: preview
+- currentCSV: elasticsearch-operator.4.2.36-202006230600.p0
+  name: '4.2'
+- currentCSV: elasticsearch-operator.4.2.36-202006230600.p0-s390x
+  name: 4.2-s390x
+- currentCSV: elasticsearch-operator.4.3.40-202010141211.p0
+  name: '4.3'
+- currentCSV: elasticsearch-operator.4.4.0-202010301137.p0
+  name: '4.4'
+- currentCSV: elasticsearch-operator.4.5.0-202011070318.p0
+  name: '4.5'
+defaultChannel: '4.5'
+packageName: elasticsearch-operator
+```
+- We only want the CSV corresponding to: "elasticsearch-operator.4.5.0-202011070318.p0", so we will leave the file as follows:
+```
+$ cat elasticsearch-operator.package.yaml
+channels:
+- currentCSV: elasticsearch-operator.4.5.0-202011070318.p0
+  name: '4.5'
+defaultChannel: '4.5'
+packageName: elasticsearch-operator
+```
+
+- We can also take a look to the contents of the directory and check we have our CRDs and our CSVs:
+```
+$ ls 4.5/
+elasticsearches.crd.yaml  elasticsearch-operator.v4.5.0.clusterserviceversion.yaml  kibanas.crd.yaml
+```
+- So we proceed with the creation of the tree structure
+```
+$ tree manifests
+manifests/
+└── etcd
+    ├── 1.24.2
+    │   ├── kiali.clusterserviceversion.yaml
+    │   ├── kiali.crd.yaml
+    │   └── kiali.monitoringdashboards.crd.yaml
+    └── package.yaml
+
+2 directories, 4 files
+```
+- Once we have this tree structure we can run the Dockerfile as we did before by creating a new one:
+
+```
+$ podman build -f custom-registry.Dockerfile \
+    -t <local_registry_host_name>:<local_registry_host_port>/<namespace>/custom-registry
+```
+In my case:
+```
+$ podman build -f custom-registry.Dockerfile \
+    -t regisrty.lab:5000/olm/elasticsearch-operator:v4.5.0
+STEP 1: FROM registry.redhat.io/openshift4/ose-operator-registry:v4.2.24 AS builder
+.
+.
+.
+STEP 11: COMMIT bastion.ff5c.sandbox474.opentlc.com:5000/olm/elasticsearch-operator:v4.5.0
+098d037be0c70772d83b27ac80d925e58ccbc9a39b6a22e894498b4be736eecc
+```
+- Once build is complete we will push it to the registry as we did before:
+```
+$ podman push registry:5000/olm/elasticsearch-operator:v4.5.0
+Getting image source signatures
+Copying blob d3e47b9840ac skipped: already exists
+Copying blob 0fb48767aa19 skipped: already exists
+Copying blob 0a09f3e3b50c skipped: already exists
+Copying blob 82480151b3e2 skipped: already exists
+Copying blob f4ccdae92040 skipped: already exists
+Copying config af33e72854 done
+Writing manifest to image destination
+Storing signatures
+```
+- With this we have our elasticsearch-operator.4.5.0-202011070318.p0 operator in our registry
+
+**Jaeger Operator**
+
+- This time we will follow the same procedure but for the jaeger operator with version: "jaeger:v1.17.7"; So first we will get the list of releases:
+
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/jaeger-product | jq .
+ {
+    "content": {
+      "digest": "d1cb9687f6157aed1314d058530823fe1987b693d4a31b55c59d21473fc9c7c6",
+      "mediaType": "application/vnd.cnr.package.helm.v0.tar+gzip",
+      "size": 16203,
+      "urls": []
+    },
+    "created_at": "2020-11-18T14:37:14",
+    "digest": "sha256:ff610014b4f7bb21a7ffc0e65d195556414c76b1af28bd4613b61e0bd6304a77",
+    "mediaType": "application/vnd.cnr.package-manifest.helm.v0.json",
+    "metadata": null,
+    "package": "redhat-operators/jaeger-product",
+    "release": "13.0.0"
+  },
+```
+- So once we have our release, in our case the one above, we take the digest from content and work with it:
+```
+"content": {
+      "digest": "d1cb9687f6157aed1314d058530823fe1987b693d4a31b55c59d21473fc9c7c6",
+```
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/jaeger-product/blobs/sha256/d1cb9687f6157aed1314d058530823fe1987b693d4a31b55c59d21473fc9c7c6 -o jaeger-product.tar.gz
+$ tar xvf jaeger-product.tar.gz
+$ ls jaeger-product-etvqlma3/
+1.13.2-1/  1.17.7/  package.yaml
+```
+- So once we decompress it, we will take a look at its channels and make sure the corresponding channel is pointing to our desired version:
+```
+$ cat package.yaml
+packageName: jaeger-product
+channels:
+- name: 1.13-stable
+  currentCSV: jaeger-operator.v1.13.2-1
+- name: 1.17-stable
+  currentCSV: jaeger-operator.v1.17.7
+- name: stable
+  currentCSV: jaeger-operator.v1.17.7
+defaultChannel: stable
+```
+- We only want the CSV corresponding to: "jaeger:v1.17.7", so we will leave the file as follows:
+```
+$ cat package.yaml
+packageName: jaeger-product
+channels:
+- name: stable
+  currentCSV: jaeger-operator.v1.17.7
+defaultChannel: stable
+```
+
+- We can also take a look to the contents of the directory and check we have our CRDs and our CSVs:
+```
+$ ls 1.17.7/
+jaeger-operator.clusterserviceversion.yaml  jaegertracing.io_jaegers_crd.yaml
+```
+- So we proceed with the creation of the tree structure
+```
+$ tree manifests/
+manifests/
+└── etcd
+    ├── 1.17.7
+    │   ├── jaeger-operator.clusterserviceversion.yaml
+    │   └── jaegertracing.io_jaegers_crd.yaml
+    └── package.yaml
+
+2 directories, 3 files
+```
+- Once we have this tree structure we can run the Dockerfile as we did before by creating a new one:
+
+```
+$ podman build -f custom-registry.Dockerfile \
+    -t <local_registry_host_name>:<local_registry_host_port>/<namespace>/custom-registry
+```
+In my case:
+```
+$ podman build -f custom-registry.Dockerfile \
+    -t regisrty.lab:5000/olm/jaeger-product:v1.17.7
+```
+- Once build is complete we will push it to the registry as we did before:
+```
+$ podman push registry.lab:5000/olm/jaeger-product:v1.17.7
+Getting image source signatures
+Copying blob 0a09f3e3b50c skipped: already exists
+Copying blob 0fb48767aa19 skipped: already exists
+Copying blob d3e47b9840ac skipped: already exists
+Copying blob 82480151b3e2 skipped: already exists
+Copying blob f4ccdae92040 skipped: already exists
+Copying config af33e72854 done
+Writing manifest to image destination
+Storing signatures
+```
+- With this we have our jaeger-product:v1.17.7 operator in our registry
+
+**Service Mesh Operator**
+
+- This time we will follow the same procedure but for the jaeger operator with version: "servicemeshoperator.v2.0.0.2"; So first we will get the list of releases:
+
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/servicemesh-operator | jq .
+  {
+    "content": {
+      "digest": "5c0dad3c9515666122775db5c6b072e3e8061fc0f9fe2fc97cbb4501dc15d3c3",
+      "mediaType": "application/vnd.cnr.package.helm.v0.tar+gzip",
+      "size": 238493,
+      "urls": []
+    },
+    "created_at": "2020-11-11T17:52:45",
+    "digest": "sha256:93cf089f8032c3870db1455b0c2c7e6b8d8de7e5f60cb04d0c3a2caa806bf75c",
+    "mediaType": "application/vnd.cnr.package-manifest.helm.v0.json",
+    "metadata": null,
+    "package": "redhat-operators/servicemeshoperator",
+    "release": "34.0.0"
+  },
+```
+- So once we have our release, in our case the one above, we take the digest from content and work with it:
+```
+"content": {
+      "digest": "5c0dad3c9515666122775db5c6b072e3e8061fc0f9fe2fc97cbb4501dc15d3c3",
+```
+```
+$ curl -X GET https://quay.io/cnr/api/v1/packages/redhat-operators/servicemeshoperator/blobs/sha256/5c0dad3c9515666122775db5c6b072e3e8061fc0f9fe2fc97cbb4501dc15d3c3 -o servicemeshoperator.tar.gz
+$ tar xvf servicemeshoperator.tar.gz
+$ ls servicemeshoperator-ce1a7wpq/
+1.0.0/	 1.0.2/  1.0.5/  1.0.8/  1.1.1/     1.1.2+2/  1.1.4/	1.1.5+2/  1.1.8/    2.0.0-1/
+1.0.1/	 1.0.3/  1.0.6/  1.0.9/  1.1.10-0/  1.1.2+3/  1.1.4+2/	1.1.6/	  1.1.9/    2.0.0-2/
+1.0.10/  1.0.4/  1.0.7/  1.1.0/  1.1.2/     1.1.3/    1.1.5/	1.1.7/	  2.0.0-0/  package.yaml
+```
+- So once we decompress it, we will take a look at its channels and make sure the corresponding channel is pointing to our desired version:
+```
+$ cat package.yaml 
+packageName: servicemeshoperator
+channels:
+- name: "1.0"
+  currentCSV: servicemeshoperator.v2.0.0.2
+- name: stable
+  currentCSV: servicemeshoperator.v2.0.0.2
+defaultChannel: stable
+```
+- We only want the CSV corresponding to: "servicemeshoperator:2.0.0.2", so we will leave the file as follows:
+```
+$ cat package.yaml
+packageName: servicemeshoperator
+channels:
+- name: stable
+  currentCSV: servicemeshoperator.v2.0.0.2
+defaultChannel: stable
+```
+- We can also take a look to the contents of the directory and check we have our CRDs and our CSVs:
+```
+$ ls 2.0.0-2/
+servicemeshcontrolplanes.crd.yaml  servicemeshmembers.crd.yaml
+servicemeshmemberrolls.crd.yaml    servicemeshoperator.clusterserviceversion.yaml
+```
+- So we proceed with the creation of the tree structure
+```
+$ tree manifests/
+manifests/
+└── etcd
+    ├── 2.0.0-2
+    │   ├── servicemeshcontrolplanes.crd.yaml
+    │   ├── servicemeshmemberrolls.crd.yaml
+    │   ├── servicemeshmembers.crd.yaml
+    │   └── servicemeshoperator.clusterserviceversion.yaml
+    └── package.yaml
+
+2 directories, 5 files
+```
+- Once we have this tree structure we can run the Dockerfile as we did before by creating a new one:
+
+```
+$ podman build -f custom-registry.Dockerfile \
+    -t <local_registry_host_name>:<local_registry_host_port>/<namespace>/custom-registry
+```
+In my case:
+```
+$ podman build -f custom-registry.Dockerfile \
+    -t regisrty.lab:5000/olm/servicemeshoperator:v2.0.0.2
+STEP 1: FROM registry.redhat.io/openshift4/ose-operator-registry:v4.2.24 AS builder
+STEP 2: COPY manifests manifests
+10e778d51ca9106bdc3ee566d61d4c534313c67432868f446d0f48394b885320
+STEP 3: RUN /bin/initializer -o ./bundles.db
+INFO[0000] loading Bundles                               dir=manifests
+INFO[0000] directory                                     dir=manifests file=manifests load=bundles
+INFO[0000] directory                                     dir=manifests file=etcd load=bundles
+INFO[0000] directory                                     dir=manifests file=2.0.0-2 load=bundles
+INFO[0000] found csv, loading bundle                     dir=manifests file=servicemeshoperator.clusterserviceversion.yaml load=bundles
+INFO[0000] loading bundle file                           dir=manifests file=servicemeshcontrolplanes.crd.yaml load=bundle
+INFO[0000] loading bundle file                           dir=manifests file=servicemeshmemberrolls.crd.yaml load=bundle
+INFO[0000] loading bundle file                           dir=manifests file=servicemeshmembers.crd.yaml load=bundle
+INFO[0000] loading bundle file                           dir=manifests file=servicemeshoperator.clusterserviceversion.yaml load=bundle
+INFO[0000] loading Packages and Entries                  dir=manifests
+INFO[0000] directory                                     dir=manifests file=manifests load=package
+INFO[0000] directory                                     dir=manifests file=etcd load=package
+INFO[0000] directory                                     dir=manifests file=2.0.0-2 load=package
+FATA[0000] permissive mode disabled                      error="error loading manifests from directory: error loading package into db: [servicemeshoperator.v2.0.0.2 specifies replacement that couldn't be found, servicemeshoperator.v2.0.0.2 specifies replacement that couldn't be found]"
+Error: error building at STEP "RUN /bin/initializer -o ./bundles.db": error while running runtime: exit status 1
+```
+- As we get the error as before, we are lacking the versions specified by the ".spec.replaces" filed in the CSV, so as we did in kiali, we will have to put the previous versions also in the tree:
+```
+$ tree manifests/
+manifests/
+└── etcd
+    ├── 1.0.0
+    │   ├── servicemeshcontrolplanes.crd.yaml
+    │   ├── servicemeshmemberrolls.crd.yaml
+    │   └── servicemeshoperator.clusterserviceversion.yaml
+    ├── 1.0.1
+    │   ├── servicemeshcontrolplanes.crd.yaml
+    │   ├── servicemeshmemberrolls.crd.yaml
+    │   └── servicemeshoperator.clusterserviceversion.yaml
+...
+    ├── 2.0.0-1
+    │   ├── servicemeshcontrolplanes.crd.yaml
+    │   ├── servicemeshmemberrolls.crd.yaml
+    │   ├── servicemeshmembers.crd.yaml
+    │   └── servicemeshoperator.clusterserviceversion.yaml
+    ├── 2.0.0-2
+    │   ├── servicemeshcontrolplanes.crd.yaml
+    │   ├── servicemeshmemberrolls.crd.yaml
+    │   ├── servicemeshmembers.crd.yaml
+    │   └── servicemeshoperator.clusterserviceversion.yaml
+    └── package.yaml
+
+30 directories, 106 files
+
+```
+- And we get the build completed:
+```
+STEP 1: FROM registry.redhat.io/openshift4/ose-operator-registry:v4.2.24 AS builder
+.
+.
+.
+STEP 11: COMMIT bastion.ff5c.sandbox474.opentlc.com:5000/olm/servicemeshoperator:v2.0.0.2
+3f87f4d5c3df79d1ccd31d93de835e6b8b0785d456eadfa1bef0fb017781166d
+```
+- Once build is complete we will push it to the registry as we did before:
+```
+$ podman push registry.lab:5000/olm/servicemeshoperator:v2.0.0.2
+Getting image source signatures
+Copying blob e47ef8b71720 done
+Copying blob 79f7ebfe5785 done
+Copying blob 82480151b3e2 skipped: already exists
+Copying blob f4ccdae92040 skipped: already exists
+Copying blob 0a09f3e3b50c skipped: already exists
+Copying config 3f87f4d5c3 done
+Writing manifest to image destination
+Storing signatures
+```
+- With this we have our servicemeshoperator:v2.0.0.2 operator in our registry
